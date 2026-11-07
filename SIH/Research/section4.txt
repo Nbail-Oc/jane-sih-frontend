@@ -1,0 +1,136 @@
+Architecture and Implementation Guide for Tor Hidden Service Intelligence CrawlingTechnical Architecture of Tor v3 Hidden Service Addressing and DescriptorsBuilding an automated crawling infrastructure for Tor hidden services requires an accurate understanding of the version 3 (v3) onion addressing scheme and descriptor resolution lifecycle. Introduced to replace the vulnerable RSA-1024/SHA-1 based v2 protocol, v3 onion services utilize modern elliptic curve cryptography (Ed25519 and SHA3-256) to eliminate directory enumeration vulnerabilities and impersonation risks.A v3 onion address is a 56-character string (excluding the .onion top-level domain suffix) formatted entirely in lowercase standard Base32 encoding. This encoding alphabet includes the letters a-z and digits 2-7, specifically excluding 0, 1, 8, and 9 to prevent visual ambiguity. Cryptographically, the 56-character string represents a 35-byte binary structure concatenated in a strict sequence:BytesComponentDescription0 – 31 (32 Bytes)Master Ed25519 Public Key (PUBKEY)The $KP\_hs\_id$ public key uniquely identifying the hidden service.32 – 33 (2 Bytes)Checksum (CHECKSUM)Truncated SHA3-256 hash over prefix, public key, and version byte.34 (1 Byte)Version Byte (VERSION)Constant single byte fixed to \x03 for v3 services.The mathematical formulation for generating the checksum is:$$\text{CHECKSUM} = \text{SHA3-256}\Big(\text{".onion checksum"} \parallel \text{PUBKEY} \parallel \text{VERSION}\Big)\Big[:2\Big]$$The complete address string is subsequently generated via Base32 encoding:$$\text{Address} = \text{Base32}\Big(\text{PUBKEY} \parallel \text{CHECKSUM} \parallel \text{VERSION}\Big) \cdot \text{".onion"}$$From an engineering perspective, a crawler can execute local pre-flight address validation without initiating network traffic. By decoding the 56-character Base32 string into its 35-byte binary representation, the application can verify that the final byte equals \x03 and that the calculated SHA3-256 checksum matches bytes 32 and 33. If validation fails, the address is malformed or represents a deprecated v2 address, allowing the crawler to discard the target immediately and avoid wasting network resources.Pythonimport base64
+import hashlib
+
+def validate_v3_onion(onion_address: str) -> bool:
+    address = onion_address.lower().strip()
+    if address.endswith(".onion"):
+        address = address[:-6]
+    
+    if len(address) != 56:
+        return False
+        
+    try:
+        decoded = base64.b32decode(address.upper() + "===")
+        if len(decoded) != 35:
+            return False
+            
+        pubkey = decoded[:32]
+        checksum = decoded[32:34]
+        version = decoded[34:]
+        
+        if version != b"\x03":
+            return False
+            
+        prefix = b".onion checksum"
+        hasher = hashlib.sha3_256()
+        hasher.update(prefix + pubkey + version)
+        computed_checksum = hasher.digest()[:2]
+        
+        return checksum == computed_checksum
+    except Exception:
+        return False
+When a valid address is requested, the client must obtain the hidden service descriptor to establish a circuit. Descriptors are signed data structures uploaded by hidden services to a set of distributed relays known as Hidden Service Directories (HSDirs). The descriptor contains the service's blinded public key ($KP\_hs\_blind\_id$), which changes periodically based on a shared random value and time period to prevent long-term tracking of the service across HSDirs. It also contains ephemeral signing keys and introduction point details, including IP addresses, ports, TLS certificates, and identity keys.If the target hidden service requires client authentication, the outer descriptor layer can only be decrypted if the crawler possesses the corresponding X25519 private key configured in Tor's authorized_clients directory. Once decrypted, the client selects one of the published introduction points, builds a circuit to a rendezvous point, and establishes an end-to-end encrypted channel.Network Traffic Routing: SOCKS5 vs SOCKS5h Protocol DynamicsRouting automated HTTP/HTTPS traffic from application runtimes through the Tor daemon requires precise configuration of proxy protocol prefixes. The Tor daemon exposes a local SOCKS5 proxy interface (by default on TCP port 9050 for the system daemon or port 9150 for Tor Browser). However, standard SOCKS5 client implementations diverge significantly in how domain name resolution is handled.The critical distinction lies between local and remote domain name resolution:socks5:// (Local Hostname Resolution): The client application attempts to resolve the domain name to an IP address using the local operating system's DNS resolver before establishing the SOCKS5 proxy connection. When supplied with a .onion address, the local DNS server fails to resolve the non-standard Top-Level Domain (TLD), throwing an NXDOMAIN error or an unhandled socket exception. Furthermore, for clearnet requests, socks5:// generates cleartext DNS queries to the local upstream DNS server, creating a severe operational security flaw known as a "DNS leak".socks5h:// (Remote Hostname Resolution / SOCKS5-Hostname): The h suffix explicitly instructs the HTTP library to bypass local DNS lookup entirely. The raw ASCII domain string (e.g., example.onion) is packed into the SOCKS5 protocol handshake frame and sent directly across the proxy connection to the Tor daemon. Tor's internal name resolution mechanism intercepts the .onion domain, queries the HSDir ring, fetches the descriptor, and completes the circuit transparently.HTTP Client LibrarySOCKS Proxy SchemeDNS Resolution Behavior.onion Resolution StatusDNS Leak VulnerabilityPython Requestssocks5://Local OS ResolverFails (ConnectionError / NXDOMAIN)High (Leaks clearnet queries)Python Requestssocks5h://Tor Proxy Remote ResolverSucceedsNone (Fully encapsulated)Python HTTPXsocks5://Local OS ResolverFailsHighPython HTTPXsocks5h://Tor Proxy Remote ResolverSucceedsNonePlaywright (Python/Node)socks5://127.0.0.1:9050Browser-Level Proxy ResolutionSucceeds (Chromium delegates to proxy)Low (When proxy flags set)Node.js Axios / Fetchsocks5://Local Node ResolverFailsHighNode.js (socks-proxy-agent)socks5h://SOCKS Agent Remote ResolverSucceedsNonePython Network Client ConfigurationFor Python's requests library, SOCKS proxy support requires installing the PySocks dependency. The proxy dictionary must explicitly use the socks5h:// protocol identifier.Pythonimport requests
+
+proxies = {
+    'http': 'socks5h://127.0.0.1:9050',
+    'https': 'socks5h://127.0.0.1:9050'
+}
+
+try:
+    response = requests.get('http://check.torproject.org', proxies=proxies, timeout=30)
+    print("Connection successful. Status:", response.status_code)
+except requests.exceptions.RequestException as e:
+    print("Routing error:", e)
+For modern async Python implementations, httpx provides robust native support for SOCKS5h proxies via httpx[socks].Pythonimport httpx
+import asyncio
+
+async def fetch_onion(url: str):
+    proxies = "socks5h://127.0.0.1:9050"
+    async with httpx.AsyncClient(proxies=proxies, timeout=60.0) as client:
+        response = await client.get(url)
+        return response.text
+Headless Browser Automation (Playwright)Unlike standard HTTP libraries, browser automation frameworks like Playwright manage networking via underlying browser engines (Chromium, Firefox, WebKit). In Playwright, passing socks5://127.0.0.1:9050 in the browser context configuration forces Chromium to route both traffic and host resolution through the specified SOCKS5 endpoint. However, to prevent potential Chromium fallback mechanisms from querying local DNS, specific command-line flags must be passed upon browser launch.Pythonfrom playwright.async_api import async_playwright
+import asyncio
+
+async def run_playwright_crawler(onion_url: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                '--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"',
+                '--no-sandbox',
+                '--disable-setuid-sandbox'
+            ],
+            proxy={
+                'server': 'socks5://127.0.0.1:9050'
+            }
+        )
+        context = await browser.new_context()
+        page = await context.new_page()
+        
+        try:
+            await page.goto(onion_url, timeout=90000, wait_until="domcontentloaded")
+            title = await page.title()
+            print(f"Page Title: {title}")
+        finally:
+            await browser.close()
+Node.js Crawler ConfigurationIn Node.js, standard networking calls or HTTP libraries like Axios do not handle SOCKS encapsulation natively. Developers must inject an agent such as socks-proxy-agent.JavaScriptconst axios = require('axios');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+
+const agent = new SocksProxyAgent('socks5h://127.0.0.1:9050');
+
+async function crawlOnion(url) {
+    try {
+        const response = await axios.get(url, {
+            httpAgent: agent,
+            httpsAgent: agent,
+            timeout: 60000,
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/115.0' }
+        });
+        console.log("Fetched length:", response.data.length);
+    } catch (error) {
+        console.error("Scraping failed:", error.message);
+    }
+}
+Programmatic Circuit Control and Health Management Using StemAutomated crawlers frequently encounter stalled circuits, network congestion, or rate limits imposed by hidden service operators. Programmatic control of the Tor process is essential for managing identity rotation, inspecting circuit state, and ensuring continuous scraping health. The official Python controller library, Stem, interacts directly with Tor’s Control Port (TCP port 9051 or Unix Domain Socket) using the Tor Control Protocol.Identity Renewal and Cooldown MechanicsTo switch exit nodes or reset circuit contexts, crawlers issue a NEWNYM signal to the Tor controller. However, sending Signal.NEWNYM does not terminate existing active TCP streams or immediately destroy established circuits. Instead, it marks all existing built circuits as "dirty". Subsequent HTTP requests issued after the signal will force Tor to construct a fresh circuit.Furthermore, Tor enforces a hard-coded 10-second minimum cooldown period between processing NEWNYM signals. Calling NEWNYM repeatedly within a 10-second window is silently ignored by the Tor daemon. Stem provides the controller.get_newnym_wait() method, which returns the integer number of seconds remaining before a new identity signal can be successfully processed.Because a single Tor instance is throughput-capped at roughly 6 circuit rotations per minute due to this cooldown, high-throughput crawling architectures must deploy multiple parallel Tor instances listening on unique SOCKS/Control port pairs (e.g., SOCKS ports 9050, 9052, 9054 with Control ports 9051, 9053, 9055).Pythonimport time
+from stem import Signal
+from stem.control import Controller
+
+def rotate_tor_circuit(control_port: int = 9051, password: str = "your_password"):
+    with Controller.from_port(port=control_port) as controller:
+        controller.authenticate(password=password)
+        
+        wait_time = controller.get_newnym_wait()
+        if wait_time > 0:
+            print(f"NEWNYM rate-limited. Must wait {wait_time} seconds.")
+            time.sleep(wait_time)
+            
+        controller.signal(Signal.NEWNYM)
+        print("Signal NEWNYM successfully dispatched.")
+Monitoring Circuit Health and Lifecycle ManagementA production crawler should actively inspect circuit states rather than blindly relying on request timeouts. Stem allows developers to iterate over active circuits, inspect their status (BUILT, GUARD, FAILED), extract exit node fingerprints, and teardown unresponsive circuits manually.Pythonfrom stem import CircStatus
+from stem.control import Controller
+
+def inspect_and_clean_circuits(control_port: int = 9051, password: str = "your_password"):
+    with Controller.from_port(port=control_port) as controller:
+        controller.authenticate(password=password)
+        
+        circuits = controller.get_circuits()
+        print(f"Total Active Circuits: {len(circuits)}")
+        
+        for circ in circuits:
+            if circ.status != CircStatus.BUILT:
+                continue
+                
+            path_info = []
+            for finger_print, nickname in circ.path:
+                path_info.append(f"{nickname} ({finger_print})")
+                
+            print(f"Circuit ID {circ.id} Path: {' -> '.join(path_info)}")
+            
+            if len(circ.path) < 3:
+                print(f"Closing anomalous circuit {circ.id}")
+                controller.close_circuit(circ.id)
+Performance Tuning via torrcTo optimize Tor for automated crawling, key parameters in the torrc configuration file should be adjusted:MaxCircuitDirtiness 60: Reduces the maximum lifespan of a circuit from the default 600 seconds (10 minutes) to 60 seconds, accelerating automatic background circuit rotation without requiring manual NEWNYM calls.NewCircuitPeriod 15: Specifies how often Tor considers building a new circuit (default 30s).CircuitBuildTimeout 10: Reduces the time Tor waits for a circuit to complete building before giving up, cutting latency when dealing with dead relays.ControlPort 9051 & CookieAuthentication 1: Enables the control interface secured by local filesystem cookie permissions.Crawler Host Environment Strategy: Operational Tradeoffs and Sandbox ArchitectureWhen building a dark web threat intelligence crawling platform, selecting the host operating system and containment model directly impacts system reliability, scalability, and operational security. The environment must prevent accidental data leakage (e.g., direct cleartext connections caused by misconfigured crawler code) while supporting continuous, automated execution.Environment ArchitectureIsolation LevelPersistence & ScalabilitySetup ComplexityBest Suited Use CaseWhonix (Gateway + Workstation)Maximum (Hardware/Hypervisor network enforcement)High (Supports persistent storage & automated daemons)Medium (Requires multi-VM deployment)Production intelligence pipelines, malware harvesting, automated scraping.Tails OSHigh (System-wide force routing)None (Amnesic design resets RAM on reboot)Low (Bootable ISO)Manual ad-hoc investigations, ephemeral analyst verification.Plain Linux VM + Local Tor DaemonLow to Medium (Software-dependent proxying)Maximum (Highly scalable, easy CI/CD integration)Low (Standard package installation)Development environments, internal testing against self-hosted onion services.Whonix Architecture: Isolation EnforcementWhonix employs a deterministic dual-VM architecture designed specifically to eliminate IP and DNS leaks:Whonix-Gateway: An isolated VM running a hardened Linux distribution that acts as an exclusive network router. It runs the Tor process and enforces strict iptables rules. All traffic originating from the internal virtual network interface is forced through Tor before hitting the physical host network.Whonix-Workstation: A completely isolated VM where crawler code, headless browsers, and databases execute. The Workstation has no direct link to the host's physical network adapter; its sole network gateway is the Whonix-Gateway.Even if a crawler library contains a bug, uses socks5:// incorrectly, or executes malicious embedded JavaScript that attempts to initiate direct socket connections to a remote IP, the Whonix-Gateway's packet filtering blocks or transparently forces the request through Tor. It provides absolute containment for continuous automated crawlers.Tails OS: Amnesic LimitationsTails (The Amnesic Incognito Live System) routes all network traffic through Tor and blocks non-Tor traffic by default. However, Tails is architected around amnesia: upon shutdown or reboot, the entire root filesystem and RAM are completely erased.While Tails offers excellent operational security for individual journalists or human analysts, it is fundamentally incompatible with long-running, automated intelligence systems. Maintaining persistent state, managing long-term crawl queues (e.g., Redis/RabbitMQ), and running multi-day database indexing pipelines are infeasible in a standard Tails deployment.Plain VM / Containerized Isolation StrategyFor development setups where Whonix overhead is too heavy, a plain Linux VM (e.g., Ubuntu/Debian) or Docker container can be hardened:Dedicated Tor Service: Install and enable the background Tor service (sudo apt install tor).Network Namespaces or Containerization: Run the crawler inside a Docker container where the network bridge is strictly bound to a Tor sidecar container or local loopback proxy.Firewall Rule Enforcement (iptables / nftables): Configure host firewall rules to reject any outgoing traffic from the crawler user account (uid) that does not target the local SOCKS port (9050) or Control port (9051).Bashsudo iptables -A OUTPUT -m owner --uid-owner crawler_user -d 127.0.0.1/32 -p tcp --dport 9050 -j ACCEPT
+sudo iptables -A OUTPUT -m owner --uid-owner crawler_user -d 127.0.0.1/32 -p tcp --dport 9051 -j ACCEPT
+sudo iptables -A OUTPUT -m owner --uid-owner crawler_user -j DROP
+Evaluation of Open-Source Tor Crawling RepositoriesSelecting existing open-source Tor crawlers requires careful verification, as many legacy repositories published prior to 2021 rely on deprecated v2 address protocols, unmaintained network libraries, or non-functional dependencies. The following tools were verified through primary repository analysis for modern Tor compatibility, active maintenance status, and functional capabilities.Repo Name + LinkWhat It DoesAlive or Dead (with evidence)Confidence & RationaleTorBothttps://github.com/dedsecinside/torbotOpen-source Python intelligence crawler for .onion services. Extracts page titles, metadata, links, email addresses, and generates JSON/visual tree graphs of site relationships. Supports custom CLI parameters and local LLM analysis integrations.AliveActive commit history with updates supporting Python 3.10+, modular CLI options (--disable-socks5, --save json), and desktop UI integration.High: Repository actively maintained with updated build documentation, modern CLI interfaces, and Python 3.10+ package structures.OnionSearchhttps://github.com/megadose/onionsearchPython CLI tool that concurrently scrapes and aggregates query search results from multiple dark web search engines (such as Ahmia, Phobos, and Tor66). Exports formatted CSV data.AliveRepository maintained with documented package updates through 2024. Fully functional against active .onion search engine endpoints.High: Established PyPI library maintained by a recognized OSINT developer (megadose) with confirmed PyPI releases.TorCrawl.pyhttps://github.com/mikemeliz/torcrawl.pyLightweight Python CLI script designed for crawling and extracting single or nested .onion and clearnet web pages via Tor. Includes built-in Yara keyword pattern matching and link depth controls.AliveStable code base receiving continuous community forks, issue tracking, and packaging updates (setup.py v1.35).High: Codebase verified directly; relies on standard Python libraries and simple proxy routing, minimizing breakage across Tor updates.GhostCrawlerhttps://github.com/Pandya-mayur/GhostCrawlerConcurrent dark web crawler built with a hybrid Python CLI and Golang microservice engine (gotor). Supports link extraction, search engine querying, page screenshots, and visual tree generation.AliveRepository active with Golang concurrent crawling implementation, modern Poetry packaging, and Docker deployment configs.High: Confirmed multi-threaded architecture with explicit support for modern Tor configuration and containerized deployment.DarkWeb-Crawling-Indexinghttps://github.com/AshwinAmbal/DarkWeb-Crawling-IndexingLegacy Python crawler based on TorSpider combined with an Apache Solr backend for indexing collected HTML content.DeadUnmaintained legacy codebase relying on deprecated dependencies, hardcoded script structures, and lacking v3 onion optimization.High: Code analysis confirms static, outdated commit structure with no recent maintenance or updates for modern Tor standards.Actionable Strategy for Systems ImplementationTo deploy a secure, compliant threat intelligence crawling system for testing against self-hosted .onion services and academic datasets, the operational engineering strategy should follow four primary principles:Enforce Hardened Isolation: Deploy the crawler within a Whonix Virtual Machine architecture or run the application inside dedicated Linux containers isolated by host firewall rules. This prevents accidental network leaks in the event of code failure or malicious script execution.Standardize Protocol Addressing: Implement strict pre-flight validation for all input target addresses using local SHA3-256 and Base32 checks. Guarantee that all network connections utilize the socks5h:// scheme across HTTP clients (requests, httpx, custom scripts) to force domain resolution to occur within Tor.Orchestrate Multi-Daemon Circuit Scaling: Configure Stem to manage identity signaling and circuit health monitoring. To bypass the mandatory 10-second NEWNYM rate-limit, run a pool of independent Tor daemon instances listening on sequential port pairs (e.g., ports 9050–9060), load-balancing scraping tasks across the pool.Leverage Maintained Open-Source Tooling: Rather than building from scratch, integrate verified, actively maintained components such as megadose/OnionSearch for initial target discovery across engines and DedSecInside/TorBot or Pandya-mayur/GhostCrawler for recursive link parsing and metadata extraction.
